@@ -1,8 +1,9 @@
 import uuid
-from datetime import datetime
-from typing import List, Optional, Dict, Any
+from datetime import datetime, UTC
+from typing import List, Optional, Dict, Any, Tuple
+from sqlalchemy import func
 from sqlalchemy.orm import Session
-from src.models import UsageEvent
+from src.models import UsageEvent, Subscription, Plan
 
 def get_existing_events(db: Session, tenant_id: uuid.UUID, idempotency_key: str) -> List[UsageEvent]:
     """
@@ -42,7 +43,7 @@ def record_usage_events(
                 quantity=api_calls,
                 token_category=None,
                 idempotency_key=f"{idempotency_key}:api_call",
-                timestamp=datetime.utcnow()
+                timestamp=datetime.now(UTC).replace(tzinfo=None)
             )
         )
 
@@ -57,7 +58,7 @@ def record_usage_events(
                     quantity=qty,
                     token_category=category,
                     idempotency_key=f"{idempotency_key}:ai_token:{category}",
-                    timestamp=datetime.utcnow()
+                    timestamp=datetime.now(UTC).replace(tzinfo=None)
                 )
             )
 
@@ -73,3 +74,66 @@ def record_usage_events(
         if existing:
             return existing
         raise e
+
+def get_monthly_usage(db: Session, tenant_id: uuid.UUID) -> Dict[str, int]:
+    """
+    Sum the quantities of all usage events for a tenant in the current calendar month.
+    Returns: {"api_calls": int, "ai_tokens": int}
+    """
+    now = datetime.now(UTC).replace(tzinfo=None)
+    start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    # Aggregate API Calls
+    api_calls_sum = db.query(func.sum(UsageEvent.quantity)).filter(
+        UsageEvent.tenant_id == tenant_id,
+        UsageEvent.usage_type == "api_call",
+        UsageEvent.timestamp >= start_of_month
+    ).scalar() or 0
+
+    # Aggregate Tokens
+    tokens_sum = db.query(func.sum(UsageEvent.quantity)).filter(
+        UsageEvent.tenant_id == tenant_id,
+        UsageEvent.usage_type == "ai_token",
+        UsageEvent.timestamp >= start_of_month
+    ).scalar() or 0
+
+    return {
+        "api_calls": int(api_calls_sum),
+        "ai_tokens": int(tokens_sum)
+    }
+
+def check_quota(
+    db: Session,
+    tenant_id: uuid.UUID,
+    requested_api_calls: int,
+    requested_tokens: int
+) -> Tuple[bool, str, int]:
+    """
+    Checks if recording the requested usage would exceed the tenant's current plan limits.
+    Returns: (is_allowed, error_reason_if_any, recommended_http_status_code)
+    """
+    # 1. Fetch the tenant's active subscription and plan
+    sub = db.query(Subscription).filter(
+        Subscription.tenant_id == tenant_id,
+        Subscription.status == "active"
+    ).first()
+
+    if not sub:
+        return False, "No active subscription found. Upgrade or payment is required.", 402
+
+    plan = db.query(Plan).filter(Plan.id == sub.plan_id).first()
+    if not plan:
+        return False, "Plan configuration not found for tenant subscription.", 402
+
+    # 2. Get current calendar month usage
+    current_usage = get_monthly_usage(db, tenant_id)
+
+    # 3. Check API calls boundary: current + requested > plan_limit
+    if current_usage["api_calls"] + requested_api_calls > plan.api_limit:
+        return False, f"API call quota exceeded. Limit: {plan.api_limit}, Current: {current_usage['api_calls']}, Requested: {requested_api_calls}", 429
+
+    # 4. Check AI tokens boundary: current + requested > plan_limit
+    if current_usage["ai_tokens"] + requested_tokens > plan.token_limit:
+        return False, f"AI token quota exceeded. Limit: {plan.token_limit}, Current: {current_usage['ai_tokens']}, Requested: {requested_tokens}", 429
+
+    return True, "", 200
