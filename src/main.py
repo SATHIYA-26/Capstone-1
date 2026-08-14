@@ -1,17 +1,22 @@
 import uuid
+import stripe
+import json
+from datetime import datetime, UTC
 from typing import Dict
-from fastapi import FastAPI, Header, HTTPException, Depends, status
+from fastapi import FastAPI, Header, HTTPException, Depends, status, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from src.database import get_db
 from src.config import settings
-from src.models import Tenant, Subscription, Plan, UsageEvent
+from src.models import Tenant, Subscription, Plan, UsageEvent, ProcessedWebhook
 from src.services import (
     get_existing_events,
     record_usage_events,
     check_quota,
     get_monthly_usage
 )
+
+stripe.api_key = settings.STRIPE_API_KEY
 
 app = FastAPI(
     title="Usage Metering & Billing Engine",
@@ -20,6 +25,10 @@ app = FastAPI(
 )
 
 # Pydantic schemas for request validation
+class CheckoutRequest(BaseModel):
+    success_url: str = "http://localhost:8000/success"
+    cancel_url: str = "http://localhost:8000/cancel"
+
 class TokenUsageSimulate(BaseModel):
     input: int = Field(default=0, ge=0)
     cached_input: int = Field(default=0, ge=0)
@@ -161,6 +170,134 @@ def generate(
             "unit": "microcents"
         }
     }
+
+
+@app.post("/checkout", status_code=status.HTTP_200_OK)
+def create_checkout_session(
+    payload: CheckoutRequest,
+    x_tenant_id: uuid.UUID = Header(None, alias="X-Tenant-ID"),
+    db: Session = Depends(get_db)
+):
+    # 1. Header Validation
+    if not x_tenant_id:
+        raise HTTPException(status_code=400, detail="Missing X-Tenant-ID header")
+
+    # 2. Check if Tenant exists
+    tenant = db.query(Tenant).filter(Tenant.id == x_tenant_id).first()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    # 3. Create Stripe Checkout Session (or return simulated session URL if using placeholder test keys)
+    try:
+        if settings.STRIPE_API_KEY.startswith("sk_test_placeholder"):
+            session_id = f"cs_test_{uuid.uuid4()}"
+            checkout_url = f"https://checkout.stripe.com/c/pay/{session_id}"
+        else:
+            session = stripe.checkout.Session.create(
+                payment_method_types=["card"],
+                mode="subscription",
+                line_items=[{
+                    "price": settings.STRIPE_PRO_PRICE_ID,
+                    "quantity": 1,
+                }],
+                metadata={
+                    "tenant_id": str(x_tenant_id)
+                },
+                success_url=payload.success_url,
+                cancel_url=payload.cancel_url,
+            )
+            session_id = session.id
+            checkout_url = session.url
+
+        return {
+            "status": "success",
+            "session_id": session_id,
+            "checkout_url": checkout_url
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Stripe Session creation error: {str(e)}")
+
+
+@app.post("/webhooks/stripe", status_code=status.HTTP_200_OK)
+async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+
+    event = None
+    if settings.STRIPE_WEBHOOK_SECRET.startswith("whsec_placeholder") and not sig_header:
+        try:
+            event = json.loads(payload.decode("utf-8"))
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid payload")
+    else:
+        if not sig_header:
+            raise HTTPException(status_code=400, detail="Missing Stripe-Signature header")
+        try:
+            event = stripe.Webhook.construct_event(
+                payload, sig_header, settings.STRIPE_WEBHOOK_SECRET
+            )
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid payload")
+        except stripe.error.SignatureVerificationError:
+            raise HTTPException(status_code=400, detail="Invalid signature")
+
+    event_id = event.get("id") if isinstance(event, dict) else getattr(event, "id", None)
+    event_type = event.get("type") if isinstance(event, dict) else getattr(event, "type", None)
+    
+    if isinstance(event, dict):
+        event_data = event.get("data", {}).get("object", {})
+    else:
+        event_data = getattr(event, "data", {}).object if hasattr(event, "data") else {}
+
+    # Deduplication check
+    existing_webhook = db.query(ProcessedWebhook).filter(ProcessedWebhook.event_id == event_id).first()
+    if existing_webhook:
+        return {"status": "ignored", "reason": "duplicate event"}
+
+    # Process events
+    if event_type in ["checkout.session.completed", "customer.subscription.updated", "customer.subscription.created"]:
+        if isinstance(event_data, dict):
+            metadata = event_data.get("metadata", {})
+            customer_id = event_data.get("customer")
+            sub_id = event_data.get("subscription") or event_id
+        else:
+            metadata = getattr(event_data, "metadata", {}) or {}
+            customer_id = getattr(event_data, "customer", None)
+            sub_id = getattr(event_data, "subscription", None) or event_id
+
+        tenant_id_str = metadata.get("tenant_id") if isinstance(metadata, dict) else getattr(metadata, "tenant_id", None)
+
+        if tenant_id_str:
+            try:
+                t_id = uuid.UUID(tenant_id_str)
+                pro_plan = db.query(Plan).filter(Plan.name == "pro").first()
+                if pro_plan:
+                    sub = db.query(Subscription).filter(Subscription.tenant_id == t_id).first()
+                    if sub:
+                        sub.plan_id = pro_plan.id
+                        sub.status = "active"
+                    else:
+                        sub = Subscription(
+                            id=uuid.uuid4(),
+                            tenant_id=t_id,
+                            plan_id=pro_plan.id,
+                            stripe_customer_id=customer_id,
+                            stripe_subscription_id=sub_id,
+                            status="active"
+                        )
+                        db.add(sub)
+            except ValueError:
+                pass
+
+    # Save event deduplication record
+    processed = ProcessedWebhook(
+        event_id=event_id,
+        processed_at=datetime.now(UTC).replace(tzinfo=None)
+    )
+    db.add(processed)
+    db.commit()
+
+    return {"status": "success", "event_id": event_id}
 
 
 @app.get("/usage", status_code=status.HTTP_200_OK)
