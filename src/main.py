@@ -15,6 +15,7 @@ from src.services import (
     check_quota,
     get_monthly_usage
 )
+from src.background import run_monthly_reconciliation
 
 stripe.api_key = settings.STRIPE_API_KEY
 
@@ -376,6 +377,18 @@ def get_usage_summary(
             "currency": "USD",
             "unit": "microcents"
         }
+    }
+
+
+@app.post("/admin/reconcile", status_code=status.HTTP_200_OK)
+def trigger_usage_reconciliation(db: Session = Depends(get_db)):
+    """
+    Background job endpoint for triggerable tenant usage reconciliation.
+    """
+    reconciliation_summary = run_monthly_reconciliation(db)
+    return {
+        "status": "success",
+        "summary": reconciliation_summary
     }
 
 
