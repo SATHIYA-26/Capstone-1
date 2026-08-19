@@ -106,17 +106,23 @@ def check_quota(
     db: Session,
     tenant_id: uuid.UUID,
     requested_api_calls: int,
-    requested_tokens: int
+    requested_tokens: int,
+    lock_for_update: bool = True
 ) -> Tuple[bool, str, int]:
     """
     Checks if recording the requested usage would exceed the tenant's current plan limits.
+    Uses pessimistic row locking (FOR UPDATE) to prevent race conditions during concurrent requests.
     Returns: (is_allowed, error_reason_if_any, recommended_http_status_code)
     """
-    # 1. Fetch the tenant's active subscription and plan
-    sub = db.query(Subscription).filter(
+    # 1. Fetch the tenant's active subscription and plan (with row lock if enabled)
+    query = db.query(Subscription).filter(
         Subscription.tenant_id == tenant_id,
         Subscription.status == "active"
-    ).first()
+    )
+    if lock_for_update:
+        query = query.with_for_update()
+
+    sub = query.first()
 
     if not sub:
         return False, "No active subscription found. Upgrade or payment is required.", 402

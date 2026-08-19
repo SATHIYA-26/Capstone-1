@@ -132,6 +132,7 @@ def generate(
     )
 
     if not allowed:
+        db.rollback()
         raise HTTPException(status_code=status_code, detail=reason)
 
     # 5. Record Usage Events
