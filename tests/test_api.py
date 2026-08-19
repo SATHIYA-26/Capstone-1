@@ -159,3 +159,21 @@ def test_get_usage_endpoint(setup_api_data):
     assert data["cost"]["amount"] == 104750
     assert data["cost"]["unit"] == "microcents"
 
+
+def test_health_check_endpoint():
+    response = client.get("/health")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "healthy"
+    assert data["service"] == "metering-billing-engine"
+    assert data["database"] == "connected"
+
+
+def test_request_tracing_middleware():
+    custom_req_id = f"custom-req-{uuid.uuid4()}"
+    response = client.get("/health", headers={"X-Request-ID": custom_req_id})
+    assert response.status_code == 200
+    assert response.headers.get("X-Request-ID") == custom_req_id
+    assert "X-Process-Time-Ms" in response.headers
+
+

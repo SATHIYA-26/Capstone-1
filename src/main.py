@@ -1,10 +1,13 @@
 import uuid
 import stripe
 import json
+import time
+import logging
 from datetime import datetime, UTC
 from typing import Dict
-from fastapi import FastAPI, Header, HTTPException, Depends, status, Request
+from fastapi import FastAPI, Header, HTTPException, Depends, status, Request, Response
 from pydantic import BaseModel, Field
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from src.database import get_db
 from src.config import settings
@@ -17,6 +20,13 @@ from src.services import (
 )
 from src.background import run_monthly_reconciliation
 
+# Configure structured logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
+)
+logger = logging.getLogger("metering_engine")
+
 stripe.api_key = settings.STRIPE_API_KEY
 
 app = FastAPI(
@@ -24,6 +34,23 @@ app = FastAPI(
     version="1.0.0",
     description="A SaaS usage metering and Stripe billing backend engine."
 )
+
+@app.middleware("http")
+async def logging_and_tracing_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    start_time = time.perf_counter()
+    
+    response = await call_next(request)
+    
+    process_time_ms = round((time.perf_counter() - start_time) * 1000, 2)
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Process-Time-Ms"] = str(process_time_ms)
+    
+    logger.info(
+        f"method={request.method} path={request.url.path} status={response.status_code} "
+        f"duration_ms={process_time_ms} request_id={request_id}"
+    )
+    return response
 
 # Pydantic schemas for request validation
 class CheckoutRequest(BaseModel):
@@ -55,10 +82,18 @@ def calculate_cost(api_calls: int, input_tokens: int, cached_input_tokens: int, 
 
 
 @app.get("/health")
-def health_check():
+def health_check(db: Session = Depends(get_db)):
+    try:
+        db.execute(text("SELECT 1"))
+        db_status = "connected"
+    except Exception as e:
+        logger.error(f"Database health check failed: {e}")
+        db_status = "disconnected"
+
     return {
-        "status": "healthy",
-        "service": "metering-billing-engine"
+        "status": "healthy" if db_status == "connected" else "degraded",
+        "service": "metering-billing-engine",
+        "database": db_status
     }
 
 
